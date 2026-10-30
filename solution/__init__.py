@@ -24,12 +24,30 @@ def apply():
     # Import GPU dependencies only when applying the training patches. This also
     # allows the reference/fallback tests to run on a CPU-only development machine.
     from .swiglu import patch_qwen2_mlp
+    from .mlp import patch_qwen2_mlp_dtype
+    from .fused_mlp import patch_qwen2_fused_mlp
+    from .padded_mlp import patch_padding_mlp
+    from .tied_weights import patch_tied_weights
+    from .metrics import patch_sft_metrics
     from .rmsnorm import patch_qwen2_rmsnorm
     from .nf4 import patch_nf4
     from .vocab_patch import patch_vocab_ops
+    from .output_dtype import patch_output_dtype
+    from .rope import patch_qwen2_rope
+    from .compile_kernels import patch_parallel_compile
+    from .attention_cache import patch_attention_cache
 
     patch_qwen2_mlp()  # Organizer example: retained, never claimed as our own.
+    patch_qwen2_mlp_dtype()  # Keep the frozen MLP's intermediates in fp16.
+    patch_qwen2_fused_mlp()  # Share the input cast and release intermediates promptly.
+    patch_padding_mlp()  # Skip only right-padding rows in frozen MLPs.
+    patch_tied_weights()  # Losslessly halve the frozen tied-table storage.
     patch_qwen2_rmsnorm()
     patch_nf4()
     patch_vocab_ops()
+    patch_sft_metrics()  # Avoid a full vocabulary copy for token accuracy.
+    patch_output_dtype()  # Metrics read half storage with unchanged fp32 math.
+    patch_qwen2_rope()  # Fuse the Q/K rotary pairs and their input gradients.
+    patch_attention_cache()  # Reuse frozen attention weights; LoRA stays unchanged.
+    patch_parallel_compile()  # Join ordinary JIT compilation during setup.
     _applied = True

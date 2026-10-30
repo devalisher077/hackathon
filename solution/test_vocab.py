@@ -153,6 +153,50 @@ def test_cuda_fp16_cross_entropy_fallback():
     _check_cross_entropy(logits, targets)
 
 
+@CUDA
+@pytest.mark.parametrize("width", [4097, 151936])
+def test_cuda_upcast_ce_reads_half_logits_without_retaining_a_float_copy(width):
+    from solution.vocab import per_token_cross_entropy_fp32, supports_cross_entropy
+
+    torch.manual_seed(113)
+    logits = torch.randn(10, width, device="cuda", dtype=torch.float16)[::2]
+    logits = logits.detach().requires_grad_(True)
+    reference = logits.detach().clone().requires_grad_(True)
+    targets = _targets(5, width, "cuda")
+    assert supports_cross_entropy(logits, targets, allow_fp16=True)
+    expected = _REFERENCE_CROSS_ENTROPY(reference.float(), targets, reduction="none")
+    saved = []
+
+    def remember(tensor):
+        saved.append((tensor.shape, tensor.dtype, tensor.untyped_storage().data_ptr()))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(remember, lambda tensor: tensor):
+        actual = per_token_cross_entropy_fp32(logits, targets)
+    assert actual.dtype == torch.float32
+    assert (logits.shape, logits.dtype, logits.untyped_storage().data_ptr()) in saved
+    assert not any(shape == logits.shape and dtype == torch.float32 for shape, dtype, _ in saved)
+    torch.testing.assert_close(actual, expected, rtol=3e-5, atol=2e-5)
+    upstream = torch.tensor([-3.0, float("inf"), 0.25, 2.0, 128.0], device="cuda")
+    dx = torch.autograd.grad(actual, logits, upstream)[0]
+    ref_dx = torch.autograd.grad(expected, reference, upstream)[0]
+    assert dx.dtype == torch.float16
+    torch.testing.assert_close(dx, ref_dx, rtol=2e-3, atol=2e-6)
+    assert torch.equal(dx[1], torch.zeros_like(dx[1]))
+
+
+@CUDA
+def test_cuda_upcast_ce_all_ignored_mean_has_zero_half_gradient():
+    from solution.vocab import per_token_cross_entropy_fp32
+
+    logits = torch.randn(3, 4097, device="cuda", dtype=torch.float16, requires_grad=True)
+    targets = torch.full((3,), -100, device="cuda", dtype=torch.long)
+    mean = per_token_cross_entropy_fp32(logits, targets).sum() / (targets != -100).sum()
+    assert torch.isnan(mean)
+    dx = torch.autograd.grad(mean, logits)[0]
+    assert dx.dtype == torch.float16 and torch.equal(dx, torch.zeros_like(dx))
+
+
 def test_cpu_invalid_target_raises_instead_of_silently_masking():
     from solution.vocab import per_token_cross_entropy
 

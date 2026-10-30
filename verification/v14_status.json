@@ -1,0 +1,68 @@
+{
+  "version": "V14",
+  "status": "training_probe_passed_final_admission_pending",
+  "solution_sha256": "0200ea59f0b8f0571475403bdf2d939e46133f53d0b60b419f83e0a0917211e0",
+  "measured_before_cleanup_sha256": "2d247af2946ad3e9c3ca990b84e84bb701eac5f53b66597b430e5e63847ab1ca",
+  "cleanup": {
+    "removed_inactive_modules_and_tests": [
+      "padded_head.py",
+      "test_padded_head.py",
+      "padded_linear.py",
+      "test_padded_linear.py"
+    ],
+    "retained_source_files_byte_identical": true
+  },
+  "observed_kaggle_probe": {
+    "whole_training_command_s": 59.05,
+    "gpu_peak_mib": 6207,
+    "gpu_test_count_before_cleanup": 254,
+    "gpu_tests_before_cleanup": "passed",
+    "final_two_repeat_and_eval_checks": "not_run"
+  },
+  "files": {
+    "__init__.py": "de58ab2ebbc3d04965bd1cc32e0a2549e0992181d6b36a55887cbf573ac05821",
+    "_mlp_grad_kernels.py": "5a3b974c32266f8ec20161f8b5b7f3cc1f9af9df0fca6410d0f28a33421b1d73",
+    "_nf4_kernels.py": "18d96180ec8ff74bc09f03c8f2f17bd67a64498d1f84073567823a698117c379",
+    "_rmsnorm_kernels.py": "bf0b08a8e078ae87b72d658315115b0f694f96eedbb37e638cc69434f4d0e87c",
+    "_rope_kernels.py": "a1595c20ea7e15a867a5afd84f026871167a142d536a13a44a9c7d135c82d2bb",
+    "_vocab_kernels.py": "0bc004b4509a225da68afb0b262c0dca577cbe6ef1771a9e2d4e925e6436762d",
+    "attention_cache.py": "c522cd650ba6109a94f9a6be7d7f5e40567ca031926d1b6d3b03b53e35d92c49",
+    "compile_kernels.py": "860c41032f57f4d9a0011bf060c73e824b3bece091cc9b8974e3245cda7b4293",
+    "fused_mlp.py": "eb33f0c8f4d6d77d74012237058c95353077f16f63bfe401e469d69bc8216aa5",
+    "metrics.py": "3083df2bbb70663b3927c8fa9a4d606ba9aff0f967a56ae29ab80c984d61a4ec",
+    "mlp.py": "ce4097e1e924d75b5cf6707dac8bd514e0b2db8bac68a5d3563751da1dae0b00",
+    "nf4.py": "bdc53d6a28870a0996cf468c4e11fb7645b5f51c0b4c84a0485ce40efa1389c0",
+    "output_dtype.py": "9a548449b8347321cb7fab09752b32fa523752a4ff6ef8b47e3429d76eea5088",
+    "padded_mlp.py": "dda22d4283c28c1f619cb9be16281332e7e1872a8651a971c772a0ea42b42e5f",
+    "rmsnorm.py": "42afc06ac1938fd90ee8392d54e71a6e2b6c83ac9e5c03a19e99bd26f8431a80",
+    "rope.py": "e559997aa3dcbfaaf28467126e5a0c26f49c96f3b796f68ebae42a4f5418aab3",
+    "scatter.py": "1fd5e12749f8625521ad0ab707fcc30f47f79d186b7d9f624e8fef42ce129ce1",
+    "swiglu.py": "e665910faeca6091c958ed7a191604484a44216f51d6fa069f5f48220e7472e6",
+    "test_attention_cache.py": "fb3fe899f9b0bd9c6eb514ab937bb9abbd8dc8b97e88d1be34d8b1c82dbb46b2",
+    "test_compile_kernels.py": "ab87120b1ec726d42fee0f79410676b94d75a1f85e92b1055c02bb460ea0945e",
+    "test_fused_mlp.py": "c623464d9f11e0138a75741d96453e888472acf8f5a47d3bafa64691eb3ea2d5",
+    "test_kernels.py": "a45b842a4f22c1aefe404baeff1ac26511253452ecb0f633c985fbc9df8b252a",
+    "test_metrics.py": "c95ef6818fa41fa54ea90f8af52f6626fbddd5630eaa95354e57f62e44575d78",
+    "test_mlp.py": "b8536ef71736e0b8342732eec80cbb7fd00dc27c80303abcb7f24e14c294b38a",
+    "test_nf4.py": "d26d0775b400e56b823627b1fd2d0add20d9abad929bc67f8dbfe733b3580f41",
+    "test_output_dtype.py": "5f0af454828a8df01e99b93f612688eafc2f679453fb9c7533b88be9f20e752c",
+    "test_padded_mlp.py": "febf080d3e36b43543edafdb90feb18c6e5e1ee898a0a82b1c500257a6313d3f",
+    "test_rmsnorm.py": "9d094b042c7421c6b383ae6795df44e1fd3904ae26f4f54bd1bcc807eeddc42b",
+    "test_rope.py": "2a25be6eb1780c509cbfd57aa7ac4c7338d8ab40fe9e50acf5b9a331d55d06ad",
+    "test_scatter.py": "dcb5b5e02c4985236b4c7744f39b6ab6dee3c50ecbc72becce3a60acb031eb4f",
+    "test_tied_weights.py": "4b68c5ba24a87daa2e913b52990f70a3a61b634f83733b59f6cd7a4b1217e8e3",
+    "test_vocab.py": "cfc52ef6bbc5b600961f6e111e580fa4439febcc868b8fb462a235fc7cf76ec4",
+    "test_vocab_patch.py": "902709a7242e4e71c883a1021ebcfa1d2b86476e03e4d13a8f24c6bb18035771",
+    "tied_weights.py": "cc1d78b4ab8a5c1c34ed0797fb8b2cb7778054e01f6d56a6903e7b63a7b2154a",
+    "vocab.py": "bdd55b15af49bdd334b62580694157e292997fa176ea986545aef43bdf6d213a",
+    "vocab_patch.py": "d21551f26dfe52961ad82ed4d6379592bfce49d070eafe0831893b0243ebb693"
+  },
+  "local_validation_after_cleanup": {
+    "command": ".venv/bin/python -m pytest solution -q -p no:cacheprovider",
+    "passed": 63,
+    "skipped_cuda": 161,
+    "warnings": 1,
+    "duration_s": 5.18,
+    "exit_code": 0
+  }
+}

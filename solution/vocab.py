@@ -10,12 +10,12 @@ from torch.autograd.function import once_differentiable
 VOCAB_BLOCK = 4096
 
 
-def supports_cross_entropy(logits, targets):
+def supports_cross_entropy(logits, targets, *, allow_fp16=False):
     return (
         isinstance(logits, torch.Tensor)
         and isinstance(targets, torch.Tensor)
         and logits.is_cuda
-        and logits.dtype == torch.float32
+        and (logits.dtype == torch.float32 or (allow_fp16 and logits.dtype == torch.float16))
         and logits.ndim == 2
         and logits.shape[0] > 0
         and 0 < logits.shape[1] <= 262144
@@ -27,12 +27,12 @@ def supports_cross_entropy(logits, targets):
     )
 
 
-def supports_entropy(logits):
+def supports_entropy(logits, *, allow_fp16=False):
     return (
         isinstance(logits, torch.Tensor)
         and not torch.is_grad_enabled()
         and logits.is_cuda
-        and logits.dtype == torch.float32
+        and (logits.dtype == torch.float32 or (allow_fp16 and logits.dtype == torch.float16))
         and logits.ndim >= 1
         and logits.numel() > 0
         and 0 < logits.shape[-1] <= 262144
@@ -89,7 +89,10 @@ class _TokenCrossEntropy(torch.autograd.Function):
 
         logits, labels, row_maxima, inverse_sums = ctx.saved_tensors
         rows, vocab = logits.shape
-        gradients = torch.empty(logits.shape, device=logits.device, dtype=torch.float32)
+        # For half inputs, this is the same cast that the backward of
+        # ForCausalLMLoss's logits.float() used to apply, without a full fp32
+        # gradient buffer or a retained fp32 copy of the input logits.
+        gradients = torch.empty(logits.shape, device=logits.device, dtype=logits.dtype)
         upstream = grad_losses.contiguous()
         with torch.cuda.device(logits.device):
             vocab_ce_backward_kernel[(rows, (vocab + VOCAB_BLOCK - 1) // VOCAB_BLOCK)](
@@ -109,12 +112,31 @@ def per_token_cross_entropy(logits, targets, ignore_index=-100):
     return _TokenCrossEntropy.apply(logits, targets, ignore_index)
 
 
-def entropy(logits):
+def per_token_cross_entropy_fp32(logits, targets, ignore_index=-100):
+    """CE of logits.float(), with the upcast fused into the CUDA loads.
+
+    The loss is fp32 and the returned input gradient has the original input
+    dtype. This separate entry point preserves per_token_cross_entropy's
+    existing native-dtype fallback contract for metrics such as rewind.
+    """
+    if (
+        not supports_cross_entropy(logits, targets, allow_fp16=True)
+        or not isinstance(ignore_index, int)
+    ):
+        return torch.nn.functional.cross_entropy(
+            logits.float(), targets, reduction="none", ignore_index=ignore_index,
+        )
+    return _TokenCrossEntropy.apply(logits, targets, ignore_index)
+
+
+def entropy(logits, *, allow_fp16=False):
     """Match TRL's per-token entropy; fuse the fp32 no-grad metric path only."""
-    if not supports_entropy(logits):
+    if not supports_entropy(logits, allow_fp16=allow_fp16):
         flat = logits.reshape(-1, logits.shape[-1])
         values = []
         for chunk in flat.split(128, dim=0):
+            if allow_fp16 and chunk.dtype == torch.float16:
+                chunk = chunk.float()
             logps = torch.nn.functional.log_softmax(chunk, dim=-1)
             values.append(-(torch.exp(logps) * logps).sum(-1))
         return torch.cat(values, dim=0).reshape(logits.shape[:-1])

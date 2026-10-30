@@ -184,3 +184,151 @@ def test_patch_is_idempotent_and_cpu_falls_back_without_gpu_imports(monkeypatch)
     assert result is marker and len(calls) == 1
     assert calls[0][0] is packed and calls[0][-1] is output
     torch.testing.assert_close(output, torch.full_like(output, 7))
+
+
+def test_scale_cache_cpu_guard_and_bounded_weak_lifetime(monkeypatch):
+    import gc
+    import solution.nf4 as implementation
+
+    implementation._clear_scale_cache()
+    quantized = torch.arange(64, dtype=torch.uint8)
+    absmax, code, offset = torch.ones(1), torch.arange(256).float(), torch.tensor(0.25)
+    assert not implementation._scale_inputs_supported(quantized, absmax, code, offset)
+    # Exercise ownership/invalidation logic on CPU independently of the CUDA
+    # guard. The fake decoder is a numerical stand-in, never production code.
+    monkeypatch.setattr(implementation, "_scale_inputs_supported", lambda *args: True)
+    monkeypatch.setattr(implementation, "_SCALE_CACHE_LIMIT", 256)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: SimpleNamespace(cuda_stream=17))
+    decodes = []
+
+    def decode(q, scales, mapping, blocksize, dtype, out):
+        decodes.append(q)
+        out.copy_(mapping[q.long()] * scales.repeat_interleave(blocksize)[:q.numel()])
+
+    fake_backend = SimpleNamespace(_dequantize_blockwise_impl=decode)
+    try:
+        first = implementation._cached_scales(fake_backend, quantized, absmax, code, offset)
+        assert implementation._cached_scales(fake_backend, quantized, absmax, code, offset) is first
+        assert len(decodes) == 1 and implementation._SCALE_CACHE_BYTES == 256
+        offset.add_(1)
+        updated = implementation._cached_scales(fake_backend, quantized, absmax, code, offset)
+        torch.testing.assert_close(updated, first + 1, rtol=0, atol=0)
+        assert len(decodes) == 2 and updated is not first
+        another = quantized.clone()
+        implementation._cached_scales(fake_backend, another, absmax, code, offset)
+        assert len(implementation._SCALE_CACHE) == 1 and implementation._SCALE_CACHE_BYTES == 256
+        decodes.clear()  # The observer must not keep the source tensor alive.
+        del another
+        gc.collect()
+        assert not implementation._SCALE_CACHE and implementation._SCALE_CACHE_BYTES == 0
+    finally:
+        implementation._clear_scale_cache()
+
+
+@pytest.fixture
+def scale_cache_backend(backend, monkeypatch):
+    import solution.nf4 as implementation
+
+    bnb, ops, _ = backend
+    for owner, name in ((ops, "_dequant_linear_fallback"), (bnb.functional, "dequantize_4bit")):
+        function = getattr(owner, name)
+        while getattr(function, "_soup_nf4_scale_cache", False):
+            function = function.__wrapped__
+        monkeypatch.setattr(owner, name, function)
+    implementation._clear_scale_cache()
+    yield bnb, ops
+    implementation._clear_scale_cache()
+
+
+@CUDA
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_shared_scale_cache_reuses_forward_backward_and_keeps_own_nf4_launches(
+    scale_cache_backend, monkeypatch, dtype,
+):
+    import solution.nf4 as implementation
+
+    bnb, ops = scale_cache_backend
+    torch.manual_seed(177)
+    weight = torch.randn(64, 128, device="cuda", dtype=torch.float16)
+    packed, state = bnb.functional.quantize_4bit(weight, quant_type="nf4", compress_statistics=True)
+    x = torch.randn(2048, 128, device="cuda", dtype=dtype, requires_grad=True)
+    upstream = torch.randn(2048, 64, device="cuda", dtype=dtype)
+    own_launches = _install_and_observe_launches(monkeypatch)
+    expected = bnb.matmul_4bit(x, packed, quant_state=state)
+    expected_gradient = torch.autograd.grad(expected, x, upstream)[0]
+    own_launches.clear()
+    decode_calls = []
+    original_decode = ops._dequantize_blockwise_impl
+
+    def observed_decode(*args, **kwargs):
+        decode_calls.append(1)
+        return original_decode(*args, **kwargs)
+
+    monkeypatch.setattr(ops, "_dequantize_blockwise_impl", observed_decode)
+    assert implementation.patch_nf4_scale_cache()
+    first_forward = ops._dequant_linear_fallback
+    first_dequant = bnb.functional.dequantize_4bit
+    assert implementation.patch_nf4_scale_cache()
+    assert ops._dequant_linear_fallback is first_forward and bnb.functional.dequantize_4bit is first_dequant
+    state_snapshot = (state.absmax, state.state2, state.offset, state.nested)
+    rng = torch.cuda.get_rng_state().clone()
+    for _ in range(2):
+        actual_x = x.detach().clone().requires_grad_(True)
+        actual = bnb.matmul_4bit(actual_x, packed, quant_state=state)
+        gradient = torch.autograd.grad(actual, actual_x, upstream)[0]
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(gradient, expected_gradient, rtol=0, atol=0)
+    assert len(decode_calls) == 1
+    assert own_launches == [weight.numel()] * 4
+    assert implementation._SCALE_CACHE_BYTES == state.absmax.numel() * 4
+    assert len(implementation._SCALE_CACHE) == 1
+    assert state.absmax is state_snapshot[0] and state.state2 is state_snapshot[1]
+    assert state.offset is state_snapshot[2] and state.nested is state_snapshot[3]
+    assert torch.equal(torch.cuda.get_rng_state(), rng)
+
+
+@CUDA
+@pytest.mark.parametrize("changed", ["quantized", "absmax", "code", "offset", "replacement"])
+def test_scale_cache_invalidates_changed_source_tensors(scale_cache_backend, changed):
+    import solution.nf4 as implementation
+
+    bnb, ops = scale_cache_backend
+    torch.manual_seed(178)
+    packed, state = bnb.functional.quantize_4bit(
+        torch.randn(64, 128, device="cuda", dtype=torch.float16),
+        quant_type="nf4", compress_statistics=True,
+    )
+
+    def cached():
+        return implementation._cached_scales(ops, state.absmax, state.state2.absmax,
+                                             state.state2.code, state.offset)
+
+    before = cached()
+    assert cached() is before
+    with torch.no_grad():
+        if changed == "replacement":
+            state.offset = state.offset.clone() + 0.125
+        else:
+            tensor = {"quantized": state.absmax, "absmax": state.state2.absmax,
+                      "code": state.state2.code, "offset": state.offset}[changed]
+            tensor.add_(1 if tensor.dtype == torch.uint8 else 0.125)
+    after = cached()
+    reference = bnb.functional.dequantize_blockwise(state.absmax, state.state2) + state.offset
+    assert after is not before
+    torch.testing.assert_close(after, reference, rtol=0, atol=0)
+    assert cached() is after
+
+
+@CUDA
+def test_scale_cache_keeps_nonnested_and_fp4_paths_original(scale_cache_backend):
+    import solution.nf4 as implementation
+
+    bnb, _ = scale_cache_backend
+    assert implementation.patch_nf4_scale_cache()
+    for quant_type, nested in (("nf4", False), ("fp4", True)):
+        weight = torch.randn(64, 128, device="cuda", dtype=torch.float16)
+        packed, state = bnb.functional.quantize_4bit(weight, quant_type=quant_type, compress_statistics=nested)
+        expected = bnb.functional.dequantize_4bit.__wrapped__(packed, state)
+        actual = bnb.functional.dequantize_4bit(packed, state)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert not implementation._SCALE_CACHE

@@ -41,6 +41,89 @@ def _compare_scalar_loss_and_grad(actual, expected, x, ref_x):
     torch.testing.assert_close(actual_grad, expected_grad, rtol=3e-4, atol=2e-6)
 
 
+def _install_causal_patch(monkeypatch, module):
+    from solution.vocab_patch import _patch_causal_lm_loss
+
+    # ForCausalLMLoss resolves fixed_cross_entropy through module globals.
+    # Keep both reference functions plain even when apply() ran beforehand.
+    monkeypatch.setattr(module, "fixed_cross_entropy", _unpatched(module, "fixed_cross_entropy"))
+    original = _unpatched(module, "ForCausalLMLoss")
+    monkeypatch.setattr(module, "ForCausalLMLoss", original)
+    aliases = []
+    for name, function in list(module.LOSS_MAPPING.items()):
+        while getattr(function, "_soup_vocab_patch", False):
+            function = function.__wrapped__
+        if function is original:
+            aliases.append(name)
+            monkeypatch.setitem(module.LOSS_MAPPING, name, original)
+    assert "ForCausalLM" in aliases
+    _patch_causal_lm_loss(module)
+    first = module.ForCausalLMLoss
+    _patch_causal_lm_loss(module)
+    assert module.ForCausalLMLoss is first
+    assert all(module.LOSS_MAPPING[name] is first for name in aliases)
+    return original
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.float64])
+def test_causal_loss_cpu_preserves_upcast_alignment_and_mapping_aliases(monkeypatch, dtype):
+    module = pytest.importorskip("transformers.loss.loss_utils")
+    original = _install_causal_patch(monkeypatch, module)
+    torch.manual_seed(78)
+    logits = torch.randn(2, 4, 17, dtype=dtype, requires_grad=True)
+    reference = logits.detach().clone().requires_grad_(True)
+    labels = torch.tensor([[-100, 1, 2, -100], [0, 3, 16, 7]])
+    expected = original(reference, labels, 17, num_items_in_batch=torch.tensor(9))
+    actual = module.ForCausalLMLoss(logits, labels, 17, num_items_in_batch=torch.tensor(9))
+    assert actual.dtype == expected.dtype == torch.float32
+    _compare_scalar_loss_and_grad(actual, expected, logits, reference)
+
+
+@CUDA
+@pytest.mark.parametrize(
+    "dtype, denominator, supplied_shift",
+    [(torch.float16, None, False), (torch.float16, 13, False),
+     (torch.float16, torch.tensor(7), True), (torch.float32, 11, True)],
+)
+def test_cuda_causal_loss_uses_original_logit_storage_and_scaled_gradient(
+    monkeypatch, dtype, denominator, supplied_shift,
+):
+    module = pytest.importorskip("transformers.loss.loss_utils")
+    from solution import vocab
+
+    original = _install_causal_patch(monkeypatch, module)
+    real_ce = vocab.per_token_cross_entropy_fp32
+    sources = []
+
+    def observed_ce(source, *args, **kwargs):
+        sources.append((source.dtype, source.untyped_storage().data_ptr()))
+        return real_ce(source, *args, **kwargs)
+
+    monkeypatch.setattr(vocab, "per_token_cross_entropy_fp32", observed_ce)
+    torch.manual_seed(79)
+    logits = torch.randn(2, 5, 151936, device="cuda", dtype=dtype, requires_grad=True)
+    reference = logits.detach().clone().requires_grad_(True)
+    labels = torch.tensor([[-100, 1, 151935, -100, 7], [0, 3, 4, 5, 6]], device="cuda")
+    kwargs = {"num_items_in_batch": denominator}
+    if supplied_shift:
+        # Explicitly supplied alignment must win over labels; shifting twice
+        # would change both the loss and every corresponding gradient row.
+        kwargs["shift_labels"] = torch.tensor(
+            [[6, -100, 3, 2, 1], [4, 8, -100, 7, -100]], device="cuda"
+        )
+    expected = original(reference, labels, 151936, **kwargs)
+    actual = module.ForCausalLMLoss(logits, labels, 151936, **kwargs)
+    assert sources == [(dtype, logits.untyped_storage().data_ptr())]
+    assert actual.dtype == expected.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=3e-5, atol=2e-5)
+    # GradScaler multiplies before the fp32 -> fp16 gradient cast. Applying
+    # its multiplier after that cast would silently lose this equivalence.
+    dx = torch.autograd.grad(actual * 32768.0, logits)[0]
+    ref_dx = torch.autograd.grad(expected * 32768.0, reference)[0]
+    assert dx.dtype == dtype
+    torch.testing.assert_close(dx, ref_dx, rtol=2e-3 if dtype == torch.float16 else 3e-4, atol=2e-6)
+
+
 @pytest.mark.parametrize("denominator", [None, 11, torch.tensor(7)])
 def test_fixed_cross_entropy_cpu_uses_original(monkeypatch, denominator):
     module = pytest.importorskip("transformers.loss.loss_utils")
@@ -210,3 +293,44 @@ def test_cuda_rewind_calls_real_kernel_and_keeps_counts(monkeypatch):
     assert counts == expected_counts == [0, 4, 5]
     assert losses[0] == 0.0
     assert losses == pytest.approx(expected_losses, rel=1e-4, abs=5e-5)
+
+
+@CUDA
+def test_cuda_causal_loss_inside_real_fp16_autocast_matches_plain_reference(monkeypatch):
+    module = pytest.importorskip("transformers.loss.loss_utils")
+    from solution import vocab
+
+    # This helper unwraps both ForCausalLMLoss and fixed_cross_entropy, so
+    # the expected result cannot accidentally pass through our kernels.
+    original = _install_causal_patch(monkeypatch, module)
+    real_ce = vocab.per_token_cross_entropy_fp32
+    fast_input_dtypes = []
+
+    def observed_ce(source, *args, **kwargs):
+        fast_input_dtypes.append(source.dtype)
+        return real_ce(source, *args, **kwargs)
+
+    monkeypatch.setattr(vocab, "per_token_cross_entropy_fp32", observed_ce)
+    torch.manual_seed(80)
+    hidden = torch.randn(2, 5, 32, device="cuda", requires_grad=True)
+    reference_hidden = hidden.detach().clone().requires_grad_(True)
+    frozen_head = torch.randn(4097, 32, device="cuda") / (32 ** 0.5)
+    labels = torch.tensor([[-100, 1, 4096, -100, 7], [0, 3, 4, 5, 6]], device="cuda")
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        logits = hidden @ frozen_head.t()
+        reference_logits = reference_hidden @ frozen_head.t()
+        assert logits.dtype == reference_logits.dtype == torch.float16
+        expected = original(reference_logits, labels, 4097, num_items_in_batch=11)
+        actual = module.ForCausalLMLoss(logits, labels, 4097, num_items_in_batch=11)
+    assert fast_input_dtypes == [torch.float16]
+    assert actual.dtype == expected.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=3e-5, atol=2e-5)
+    gradients = torch.autograd.grad(actual * 32768.0, (logits, hidden))
+    reference_gradients = torch.autograd.grad(
+        expected * 32768.0, (reference_logits, reference_hidden)
+    )
+    assert gradients[0].dtype == torch.float16 and gradients[1].dtype == torch.float32
+    torch.testing.assert_close(gradients[0], reference_gradients[0], rtol=2e-3, atol=2e-6)
+    # The head's fp16 matmul adds its own accumulation and rounding; verify
+    # that the scaled CE gradient also propagates through this real AMP path.
+    torch.testing.assert_close(gradients[1], reference_gradients[1], rtol=3e-3, atol=5e-2)

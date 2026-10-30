@@ -18,7 +18,9 @@ def vocab_tile_stats_kernel(
     tile = tl.program_id(1)
     columns = tile * BLOCK + tl.arange(0, BLOCK)
     valid = columns < VOCAB
-    values = tl.load(logits_ptr + row * row_stride + columns, mask=valid, other=-float("inf"))
+    values = tl.load(
+        logits_ptr + row * row_stride + columns, mask=valid, other=-float("inf")
+    ).to(tl.float32)
     maximum = tl.max(values, axis=0)
     # Padded lanes contribute neither mass nor moment; avoid 0 * -inf there.
     shifted = tl.where(valid, values - maximum, 0.0)
@@ -51,7 +53,9 @@ def vocab_ce_reduce_kernel(
     selected = (target != IGNORE_INDEX) & (target >= 0) & (target < VOCAB)
     # Target validity is also checked before the launch. This mask ensures an
     # ignored or invalid target can never cause an out-of-bounds logits load.
-    target_value = tl.load(logits_ptr + row * row_stride + target, mask=selected, other=0.0)
+    target_value = tl.load(
+        logits_ptr + row * row_stride + target, mask=selected, other=0.0
+    ).to(tl.float32)
     loss = (maximum - target_value) + tl.log(total)
     tl.store(losses_ptr + row, tl.where(target == IGNORE_INDEX, 0.0, loss))
     tl.store(row_maxima_ptr + row, maximum)
@@ -68,7 +72,9 @@ def vocab_ce_backward_kernel(
     tile = tl.program_id(1)
     columns = tile * BLOCK + tl.arange(0, BLOCK)
     valid = columns < VOCAB
-    values = tl.load(logits_ptr + row * row_stride + columns, mask=valid, other=0.0)
+    values = tl.load(
+        logits_ptr + row * row_stride + columns, mask=valid, other=0.0
+    ).to(tl.float32)
     maximum = tl.load(row_maxima_ptr + row)
     inverse_sum = tl.load(inverse_sums_ptr + row)
     target = tl.load(targets_ptr + row)
