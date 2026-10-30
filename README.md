@@ -1,74 +1,95 @@
 # Soup Kernel Challenge
 
-## Current experiment: custom RMSNorm
+## Current experiment: RMSNorm, vocabulary reductions and NF4
 
-This working copy adds an original fused RMSNorm forward and input-gradient
-implementation in `solution/_rmsnorm_kernels.py`, connected to Qwen2 through
-`solution/rmsnorm.py` and `solution.apply()`. The organizer's SwiGLU example is
-retained unchanged and is **not** claimed as an original kernel.
+The previous RMSNorm-only version was measured by the team on Kaggle T4: the
+organizer recognized both original kernels, but their measured share was **1.3%**,
+below the mandatory 5%. That is a failed admission check, not a compilation error.
+Complete speed, memory and quality numbers for that run have not been supplied.
 
-The fast path handles CUDA fp32 inputs and frozen fp32 norm weights. It combines
-the row reduction, normalization and scale multiplication into one forward
-launch, and the input-gradient operations into one backward launch. Each token
-is one row; reductions use fp32. CPU, other dtypes and trainable weights use the
-original Qwen2 operation. Training settings, metrics and adapter parameters are
-unchanged. The fast path supports first-order gradients, as used by this task.
+This iteration retains RMSNorm and adds useful work in three places:
 
-The normalization is `y = w * x * r`, where
-`r = 1 / sqrt(mean(x*x) + epsilon)`. For frozen `w`, its input gradient is
-`dx = r * (g*w - x*r*r*mean(g*w*x))`. The implementation was written for this
-solution from these equations, not copied from another kernel library.
+- `solution/_vocab_kernels.py`: tiled cross-entropy forward/backward and per-token
+  entropy. A 4096-element tile avoids a single enormous vocabulary block.
+  The two-stage reduction stores only small row/tile statistics, not full
+  log-probability and probability intermediates. Logits remain intact.
+- `solution/vocab_patch.py`: narrow hooks into Transformers' `fixed_cross_entropy`,
+  TRL SFTTrainer's imported `entropy_from_logits`, and Soup's rewind `row_losses`.
+  Causal shifts, ignore masks, external `num_items_in_batch`, accuracy, attention
+  masks, row counts and training settings remain owned by the original callers.
+- `solution/_nf4_kernels.py`: original high-nibble-first NF4 unpack/lookup/scale.
+  `solution/nf4.py` replaces the shared CUDA backend dequantization helper in
+  bitsandbytes 0.50.2. Double quantization, matrix multiplication and autograd stay
+  with bitsandbytes; the existing output buffer and fp16/fp32 dtype are preserved.
 
-References for the required semantics and integration:
+`solution.apply()` connects all patches. The organizer's SwiGLU example remains
+unchanged and is not claimed as an original kernel. There are seven original
+`@triton.jit` functions; the organizer example is excluded from that count.
 
-- [Transformers 5.16.1 Qwen2 RMSNorm](https://github.com/huggingface/transformers/blob/v5.16.1/src/transformers/models/qwen2/modeling_qwen2.py)
-- [PEFT 0.20.0 k-bit preparation](https://github.com/huggingface/peft/blob/v0.20.0/src/peft/utils/other.py)
+### Scope and numerical contracts
 
-### Validate this experiment on Kaggle
+RMSNorm and vocabulary fast paths use CUDA fp32. Entropy is fused only under
+`no_grad`; calls requiring entropy gradients keep the original implementation.
+NF4 supports contiguous uint8 packed weights, decoded fp32 scales and contiguous
+fp16/fp32 output. Unsupported inputs fall back to the original operations.
+The custom autograd paths support first-order gradients, as used by this task.
+No full-logit tensor is modified in place or discarded before the metrics use it.
 
-1. Copy this working copy's `solution/` into the team repository provided by the
-   hackathon platform, commit and push it.
-2. In `templates/kaggle_notebook.ipynb`, set `REPO_URL` to that team repository.
-   Leave `COMMIT` empty during development or set it to the new commit. A pinned
-   old commit will still run the old code.
-3. Use the template's setup and clone cells, then run the kernel tests from the
-   repository root:
+The CE reductions are numerically centered on each row's maximum. Entropy uses
+`log(S) - T/S`, where `S = sum(exp(x-M))` and `T = sum(exp(x-M)*(x-M))`.
+This avoids cancellation from a large common offset in logits. Ignored CE rows
+return zero and have zero input gradient, including an all-ignored mean loss.
+
+The implementation was written from the operation equations and format/API
+contracts, not copied from another project's GPU kernels. Sources:
+
+- [Transformers 5.16.1 loss semantics](https://github.com/huggingface/transformers/blob/v5.16.1/src/transformers/loss/loss_utils.py)
+- [Qwen2 RMSNorm](https://github.com/huggingface/transformers/blob/v5.16.1/src/transformers/models/qwen2/modeling_qwen2.py)
+- [TRL 0.29.1 entropy helper](https://github.com/huggingface/trl/blob/v0.29.1/trl/trainer/utils.py)
+- [TRL SFTTrainer metrics](https://github.com/huggingface/trl/blob/v0.29.1/trl/trainer/sft_trainer.py)
+- [Soup 0.77.0 rewind contract](https://github.com/MakazhanAlpamys/Soup/blob/v0.77.0/src/soup_cli/trainer/rewind_hf.py)
+- [bitsandbytes 0.50.2 Python backend API](https://github.com/bitsandbytes-foundation/bitsandbytes/blob/0.50.2/bitsandbytes/backends/cuda/ops.py)
+- [NF4 numeric format data](https://github.com/bitsandbytes-foundation/bitsandbytes/blob/0.50.2/bitsandbytes/functional.py)
+
+### Run on Kaggle T4
+
+1. Upload the entire updated `solution/` directory to the repository used by the
+   notebook and commit it. For final submission, use the repository provided by
+   the hackathon platform.
+2. Set `REPO_URL` and `COMMIT` in `templates/kaggle_notebook.ipynb` to the repository
+   and revision containing this update. An old commit still runs RMSNorm only.
+3. Run the notebook's setup, clone and test cells. It preserves earlier local
+   runs in a `repo_backup_...` directory when cloning again.
+4. All CUDA tests must pass, not merely be skipped:
 
    ```bash
    python -m pytest solution -v
    ```
 
-   CUDA tests must pass, not merely be skipped. The new tests compare forward
-   values and input gradients with PyTorch, cover the actual hidden size 1536,
-   padding in the reduction, near-zero inputs, strided tensors, autocast and
-   Qwen2 integration. Fallback tests also check weight gradients and dtype rules.
-
-4. If tests pass, run the template's full benchmark and rule checks:
+5. Run the unchanged full harness:
 
    ```bash
    python harness/run_task.py
    python harness/check_rules.py
    ```
 
-   Inspect `runs/result.json`, `runs/checks.json` and
-   `runs/solution_1/metrics.json` (kernel launches and measured time).
+Inspect `runs/checks.json`, `runs/result.json` and the per-run `metrics.json`.
+These files provide the measured own-kernel share and all admission checks.
 
-**Validation status:** no Kaggle run of this experiment has been performed yet.
-Local validation on macOS with PyTorch 2.11.0 and Transformers 5.16.1:
-`python -m pytest solution -q` completed with **6 passed, 16 skipped**. The 16
-CUDA cases were skipped because this machine has no CUDA GPU. Static inspection
-with the organizer's unchanged `source_kernels()` recognizes both new kernels,
-with no banned imports or example-similarity flags.
+**This extended bundle has not yet been run on Kaggle.** Compilation on T4,
+GPU correctness, all 79 patched Soup tests, the full training comparison, runtime,
+memory, quality and the >=5% share remain to be established there. Adding these
+operations does not guarantee admission or a speedup. No artificial work is added
+to increase the measured share.
 
-GPU compilation, numerical accuracy, all 79 Soup regression tests, the complete
-training comparison and the 5% original-kernel share remain to be verified on
-T4. CPU fallback tests and source inspection cannot establish these results.
-RMSNorm alone may occupy less than 5% after fusion; if so, profile the run and add
-another useful operation. Do not add artificial work to increase that share.
+Local verification with PyTorch 2.11.0 and the pinned Transformers/TRL/Soup/PEFT
+versions: **17 passed, 54 skipped** (`python -m pytest solution -q`). The skipped
+cases require CUDA. The suite contains 71 cases in total. Static source checks
+recognize seven original kernels with no banned imports or similarity flags.
+The organizer's `harness/`, `tests/`, `task/` and example SwiGLU are unchanged.
 
-The starter instructions below remain applicable. This is a prototype, not a
-finished submission; the team repository, saved Kaggle results and submission
-artifacts still need to be supplied.
+The starter instructions below remain applicable. Final measured results,
+Kaggle links, commit links and submission artifacts still need to be recorded.
 
 ---
 

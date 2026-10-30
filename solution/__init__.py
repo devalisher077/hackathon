@@ -25,7 +25,11 @@ def apply():
     # allows the reference/fallback tests to run on a CPU-only development machine.
     from .swiglu import patch_qwen2_mlp
     from .rmsnorm import patch_qwen2_rmsnorm
+    from .nf4 import patch_nf4
+    from .vocab_patch import patch_vocab_ops
 
     patch_qwen2_mlp()  # Organizer example: retained, never claimed as our own.
     patch_qwen2_rmsnorm()
+    patch_nf4()
+    patch_vocab_ops()
     _applied = True
